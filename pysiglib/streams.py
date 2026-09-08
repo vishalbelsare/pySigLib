@@ -13,7 +13,7 @@
 # limitations under the License.
 # =========================================================================
 
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Optional
 import numpy as np
 import torch
 
@@ -24,6 +24,9 @@ from .sig import sig_combine, sig
 from .log_sig_join import log_sig_join
 from .log_sig_combine import log_sig_combine
 from .log_sig import log_sig
+from .branched_sig import branched_sig, branched_sig_combine, branched_sig_length
+from .branched_log_sig import (branched_log_sig, branched_sig_to_log_sig,
+                               _resolve_branched_log_sig_method)
 
 try:
     import jax
@@ -207,12 +210,12 @@ class SigStream:
     def __init__(self, dimension: int, degree: int,
                  *,
                  scalar_term: bool = False, n_jobs: int = 1,
-                 _sig_join=None, _sig_combine=None, _sig=None):
+                 _sig_join=None, _sig_combine=None, _sig=None, _sig_length=None):
         check_n_jobs(n_jobs)
         self._dimension = dimension
         self._degree = degree
         self._scalar_term = scalar_term
-        self._sig_len = sig_length(dimension, degree, scalar_term=scalar_term)
+        self._sig_len = (_sig_length or sig_length)(dimension, degree, scalar_term=scalar_term)
         raw_sig = _sig or sig
         raw_sig_join = _sig_join or sig_join
         raw_sig_combine = _sig_combine or sig_combine
@@ -362,6 +365,169 @@ class SigStream:
     def batch_shape(self) -> Union[tuple, None]:
         """Batch shape locked in by the first push, or ``None`` if nothing has been pushed."""
         return self._batch_shape
+
+
+class BranchedSigStream(SigStream):
+    """
+    A stateful stream of cumulative branched signatures with push/pop operations
+    and interval queries via the branched Chen identity.
+
+    Supports numpy arrays, torch tensors (with autograd via ``pysiglib.torch_api``),
+    and JAX arrays (via ``pysiglib.jax_api``). The batch shape is inferred from
+    the first ``push`` / ``push_batch`` call and must stay the same.
+
+    Each ``push`` stores one checkpoint. Each non-empty ``push_batch`` stores
+    its endpoint. If the stream is empty, it also stores the first point when
+    the batch contains more than one point. Query indices refer to these
+    checkpoints. The lift uses piecewise linear path segments without correction
+    terms.
+
+    Call ``prepare_branched_sig(dimension, degree, planar=planar)`` before use.
+
+    :param dimension: Dimension of the underlying path.
+    :type dimension: int
+    :param degree: Maximum order (number of nodes).
+    :type degree: int
+    :param planar: If True, use the planar MKW ordered forest basis.
+        If False (default), use the non-planar BCK rooted tree basis.
+    :type planar: bool
+    :param scalar_term: If True, include the leading constant 1.
+        If False (default), omit this term.
+    :type scalar_term: bool
+    :param n_jobs: Number of threads for internal branched signature operations.
+        ``-1`` uses all available threads.
+    :type n_jobs: int
+
+    Example::
+
+        import numpy as np
+        import pysiglib
+
+        pysiglib.prepare_branched_sig(2, 3)
+        stream = pysiglib.BranchedSigStream(2, 3)
+        path = np.random.randn(20, 2)
+        for point in path:
+            stream.push(point)
+        result = stream.sig(5, 15)
+    """
+
+    def __init__(self, dimension: int, degree: int,
+                 *,
+                 planar: bool = False, scalar_term: bool = False, n_jobs: int = 1,
+                 _branched_sig=None, _branched_sig_combine=None):
+        check_type(planar, "planar", bool)
+        raw_sig = _branched_sig or branched_sig
+        raw_combine = _branched_sig_combine or branched_sig_combine
+        sig_fn = lambda path, deg, **kwargs: raw_sig(path, deg, planar=planar, **kwargs)
+        combine_fn = lambda s1, s2, dim, deg, **kwargs: raw_combine(
+            s1, s2, dim, deg, planar=planar, **kwargs)
+        length_fn = lambda dim, deg, **kwargs: branched_sig_length(
+            dim, deg, planar=planar, **kwargs)
+
+        def join_fn(s, displacement, dim, deg, *, prepend=False, n_jobs=1):
+            zero = _make_zero(dim, displacement.shape[:-1], displacement)
+            segment = _cat_time(_expand_time(zero), _expand_time(displacement))
+            segment_sig = sig_fn(segment, deg, scalar_term=scalar_term, n_jobs=n_jobs)
+            if prepend:
+                return combine_fn(segment_sig, s, dim, deg, n_jobs=n_jobs)
+            return combine_fn(s, segment_sig, dim, deg, n_jobs=n_jobs)
+
+        super().__init__(dimension, degree, scalar_term=scalar_term, n_jobs=n_jobs,
+                         _sig_join=join_fn, _sig_combine=combine_fn, _sig=sig_fn,
+                         _sig_length=length_fn)
+
+
+class BranchedLogSigStream(BranchedSigStream):
+    """
+    A stateful stream of branched log signatures with push/pop operations and
+    interval queries. Cumulative branched signatures and their inverses are
+    stored; query results are converted to branched log signatures.
+
+    Supports numpy arrays, torch tensors (with autograd via ``pysiglib.torch_api``),
+    and JAX arrays (via ``pysiglib.jax_api``). The batch shape is inferred from
+    the first ``push`` / ``push_batch`` call and must stay the same.
+
+    Each ``push`` stores one checkpoint. Each non-empty ``push_batch`` stores
+    its endpoint. If the stream is empty, it also stores the first point when
+    the batch contains more than one point. Query indices refer to these
+    checkpoints. The lift uses piecewise linear segments without corrections.
+
+    Call ``prepare_branched_log_sig(dimension, degree, method, planar=planar)``
+    before use. This also prepares the branched-signature cache.
+
+    :param dimension: Dimension of the underlying path.
+    :type dimension: int
+    :param degree: Maximum order (number of nodes).
+    :type degree: int
+    :param planar: If True, use the planar MKW basis. If False (default),
+        use the non-planar BCK basis.
+    :type planar: bool
+    :param scalar_term: If True, method 0 includes the leading scalar zero.
+        Methods 1 and 2 are scalar-free.
+    :type scalar_term: bool
+    :param method: Conversion method (0, 1, or 2). Method 0 returns expanded
+        coordinates. Methods 1 and 2 return compressed MKW coordinates and
+        require ``planar=True``. Defaults to 0 for non-planar streams and 1
+        for planar streams. Method 3 requires path-based BCH computation and
+        is not available for interval queries.
+    :type method: int | None
+    :param n_jobs: Number of threads for internal operations.
+        ``-1`` uses all available threads.
+    :type n_jobs: int
+
+    Example::
+
+        import numpy as np
+        import pysiglib
+
+        pysiglib.prepare_branched_log_sig(2, 3, 0)
+        stream = pysiglib.BranchedLogSigStream(2, 3)
+        for point in np.random.randn(20, 2):
+            stream.push(point)
+        result = stream.sig(5, 15)
+    """
+
+    def __init__(self, dimension: int, degree: int,
+                 *,
+                 planar: bool = False, scalar_term: bool = False,
+                 method: Optional[int] = None, n_jobs: int = 1,
+                 _branched_sig=None, _branched_sig_combine=None,
+                 _branched_sig_to_log_sig=None):
+        method = _resolve_branched_log_sig_method(method, planar)
+        if method == 3:
+            raise ValueError(
+                "BranchedLogSigStream supports method=0, 1 or 2. "
+                "Method 3 requires path-based BCH computation; "
+                "use method=2 for the same coordinate basis.")
+        super().__init__(dimension, degree, planar=planar, scalar_term=scalar_term,
+                         n_jobs=n_jobs, _branched_sig=_branched_sig,
+                         _branched_sig_combine=_branched_sig_combine)
+        raw_convert = _branched_sig_to_log_sig or branched_sig_to_log_sig
+        self._to_log_sig_fn = lambda s: raw_convert(
+            s, dimension, degree, planar=planar, method=method, n_jobs=n_jobs)
+
+    def sig(self, start: int, end: int) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Query the branched log signature between two checkpoints.
+
+        :param start: Start checkpoint index (absolute, inclusive).
+        :type start: int
+        :param end: End checkpoint index (absolute, inclusive).
+        :type end: int
+        :return: Branched log signature of shape ``(..., length)``.
+        :rtype: numpy.ndarray | torch.Tensor
+        """
+        return self._to_log_sig_fn(super().sig(start, end))
+
+    def sig_all(self) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Return cumulative branched log signatures at all retained checkpoints.
+
+        :return: Array of shape ``(n, ..., length)``. Each entry starts at the
+            original first point, including after ``pop_front``.
+        :rtype: numpy.ndarray | torch.Tensor
+        """
+        return self._to_log_sig_fn(super().sig_all())
 
 
 class LogSigStream:
@@ -640,6 +806,8 @@ class _WindowStream:
         first = self._pending[0]
         if isinstance(first, torch.Tensor):
             batch = torch.stack(self._pending, dim=-2)
+        elif _is_jax(first):
+            batch = jnp.stack(self._pending, axis=-2)
         else:
             batch = np.stack(self._pending, axis=-2)
         if self._buffer is None:
@@ -748,6 +916,130 @@ class SigWindowStream(_WindowStream):
         check_n_jobs(n_jobs)
         raw_sig = _sig or sig
         sig_fn = lambda path, deg: raw_sig(path, deg, scalar_term=scalar_term, n_jobs=n_jobs)
+        super().__init__(sig_fn, dimension, degree, window_size, stride)
+
+
+class BranchedSigWindowStream(_WindowStream):
+    """
+    A fixed-width sliding window that emits branched signatures every ``stride``
+    points once a complete window is available.
+
+    Supports numpy arrays, torch tensors (with autograd via ``pysiglib.torch_api``),
+    and JAX arrays (via ``pysiglib.jax_api``). The batch shape is inferred from
+    the first ``push`` / ``push_batch`` call. Each batch item is windowed
+    independently along the time axis. The lift uses piecewise linear path
+    segments without correction terms.
+
+    Call ``prepare_branched_sig(dimension, degree, planar=planar)`` before use.
+
+    :param dimension: Dimension of the underlying path.
+    :type dimension: int
+    :param degree: Maximum order (number of nodes).
+    :type degree: int
+    :param window_size: Number of points per window.
+    :type window_size: int
+    :param stride: Number of points between successive window starts. Default 1.
+    :type stride: int
+    :param planar: If True, use the planar MKW ordered forest basis.
+        If False (default), use the non-planar BCK rooted tree basis.
+    :type planar: bool
+    :param scalar_term: If True, include the leading constant 1 in each window.
+        If False (default), omit this term.
+    :type scalar_term: bool
+    :param n_jobs: Number of threads for internal branched signature operations.
+        ``-1`` uses all available threads.
+    :type n_jobs: int
+
+    Example::
+
+        import numpy as np
+        import pysiglib
+
+        pysiglib.prepare_branched_sig(2, 3)
+        stream = pysiglib.BranchedSigWindowStream(2, 3, window_size=10, stride=5)
+        stream.push_batch(np.random.randn(4, 50, 2))
+        result = stream.sig()  # shape (num_windows, 4, branched_sig_length)
+    """
+
+    def __init__(self, dimension: int, degree: int, window_size: int,
+                 *,
+                 stride: int = 1, planar: bool = False, scalar_term: bool = False,
+                 n_jobs: int = 1, _branched_sig=None):
+        check_type(window_size, "window_size", int)
+        check_type(stride, "stride", int)
+        check_type(planar, "planar", bool)
+        check_pos(window_size, "window_size")
+        check_pos(stride, "stride")
+        check_n_jobs(n_jobs)
+        branched_sig_length(dimension, degree, planar=planar, scalar_term=scalar_term)
+        raw_sig = _branched_sig or branched_sig
+        sig_fn = lambda path, deg: raw_sig(
+            path, deg, planar=planar, scalar_term=scalar_term, n_jobs=n_jobs)
+        super().__init__(sig_fn, dimension, degree, window_size, stride)
+
+
+class BranchedLogSigWindowStream(_WindowStream):
+    """
+    A fixed-width sliding window that emits branched log signatures every
+    ``stride`` points once a complete window is available.
+
+    Supports numpy arrays, torch tensors (with autograd via ``pysiglib.torch_api``),
+    and JAX arrays (via ``pysiglib.jax_api``). The batch shape is inferred from
+    the first ``push`` / ``push_batch`` call. Each batch item is windowed
+    independently along the time axis. The lift uses piecewise linear segments
+    without corrections.
+
+    Call ``prepare_branched_log_sig(dimension, degree, method, planar=planar)``
+    before use.
+
+    :param dimension: Dimension of the underlying path.
+    :type dimension: int
+    :param degree: Maximum order (number of nodes).
+    :type degree: int
+    :param window_size: Number of points per window.
+    :type window_size: int
+    :param stride: Number of points between successive window starts. Default 1.
+    :type stride: int
+    :param planar: If True, use the planar MKW basis. If False (default),
+        use the non-planar BCK basis.
+    :type planar: bool
+    :param scalar_term: If True, method 0 includes the leading scalar zero.
+        Methods 1, 2, and 3 are scalar-free.
+    :type scalar_term: bool
+    :param method: Computation method (0, 1, 2, or 3). Method 0 returns expanded
+        coordinates. Methods 1, 2, and 3 return compressed MKW coordinates and
+        require ``planar=True``. Method 3 uses direct BCH updates. Defaults
+        to 0 for non-planar streams and 1 for planar streams.
+    :type method: int | None
+    :param n_jobs: Number of threads for internal operations.
+        ``-1`` uses all available threads.
+    :type n_jobs: int
+
+    Example::
+
+        import numpy as np
+        import pysiglib
+
+        pysiglib.prepare_branched_log_sig(2, 3, 0)
+        stream = pysiglib.BranchedLogSigWindowStream(2, 3, window_size=10, stride=5)
+        stream.push_batch(np.random.randn(4, 50, 2))
+        result = stream.sig()
+    """
+
+    def __init__(self, dimension: int, degree: int, window_size: int,
+                 *,
+                 stride: int = 1, planar: bool = False, scalar_term: bool = False,
+                 method: Optional[int] = None, n_jobs: int = 1, _branched_log_sig=None):
+        check_type(window_size, "window_size", int)
+        check_type(stride, "stride", int)
+        check_pos(window_size, "window_size")
+        check_pos(stride, "stride")
+        check_n_jobs(n_jobs)
+        method = _resolve_branched_log_sig_method(method, planar)
+        branched_sig_length(dimension, degree, planar=planar, scalar_term=scalar_term)
+        raw_log_sig = _branched_log_sig or branched_log_sig
+        sig_fn = lambda path, deg: raw_log_sig(
+            path, deg, planar=planar, scalar_term=scalar_term, method=method, n_jobs=n_jobs)
         super().__init__(sig_fn, dimension, degree, window_size, stride)
 
 
